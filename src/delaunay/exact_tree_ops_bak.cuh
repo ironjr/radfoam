@@ -12,15 +12,22 @@ namespace radfoam {
 // Helper function to emulate __reduce_or_sync using shuffle down
 __device__ inline unsigned warp_reduce_or(unsigned mask, unsigned val) {
     unsigned warp_size = 32;
-    // First do the reduction
     for (int offset = warp_size / 2; offset > 0; offset /= 2) {
         val |= __shfl_down_sync(mask, val, offset);
     }
-    // Broadcast result back to all threads
-    return __shfl_sync(mask, val, 0);
+    return val;
+}
+
+// Emulate warp-wide minimum reduction
+__device__ inline unsigned warp_reduce_min(unsigned val) {
+    // reduce within the warp: each thread carries a candidate index or UINT32_MAX.
+    for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+        unsigned other = __shfl_down_sync(0xffffffff, val, offset);
+        val = min(val, other);
+    }
+    return val;
 }
 #endif
-
 
 /// @brief Find the nearest neighbours of points in the point set
 inline __device__ uint32_t
@@ -366,14 +373,15 @@ inline __device__ uint32_t maximal_empty_sphere(const Vec3f *points,
         flag &= !should_ignore;
 
         if (__any_sync(0xffffffff, flag)) {
-            uint32_t t = 0;
+            uint32_t candidate = UINT32_MAX;
             if (sphere_predicate.warp_update(point, flag, found)) {
-                t = point_idx;
+                candidate = point_idx;
             }
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800)
-            tangent_idx = warp_reduce_or(0xffffffff, t);
+            candidate = warp_reduce_min(candidate);
+            tangent_idx = candidate;
 #else
-            tangent_idx = __reduce_or_sync(0xffffffff, t);
+            tangent_idx = __reduce_min_sync(0xffffffff, candidate);
 #endif
         }
     }
@@ -406,14 +414,15 @@ inline __device__ uint32_t maximal_empty_sphere(const Vec3f *points,
         flag &= !should_ignore;
 
         if (__any_sync(0xffffffff, flag)) {
-            uint32_t t = 0;
+            uint32_t candidate = UINT32_MAX;
             if (sphere_predicate.warp_update(point, flag, found)) {
-                t = point_idx;
+                candidate = point_idx;
             }
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800)
-            tangent_idx = warp_reduce_or(0xffffffff, t);
+            candidate = warp_reduce_min(candidate);
+            tangent_idx = candidate;
 #else
-            tangent_idx = __reduce_or_sync(0xffffffff, t);
+            tangent_idx = __reduce_min_sync(0xffffffff, candidate);
 #endif
         }
     };
