@@ -261,7 +261,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                         count = param_count[n]
                         if count > 1:
                             mu = param_mu[n]
-                            p.grad.data = mu.to(p.device) * 1e2
+                            p.grad.data = mu.to(p.device)
 
                             # variance = param_sigma[n] - param_mu[n].pow(2)  # Compute variance
                             # variance = torch.clamp(variance, min=min_variance_threshold)
@@ -272,7 +272,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                             # gn_update = mu / (variance + damping_factor)
                             # p.grad.data = (current_lr * gn_update).to(p.device)
 
-                            learning_rate = 1e2
+                            learning_rate = 1e4
                             if n == "primal_points":
                                 learning_rate *= model.xyz_scheduler_args(i)
                             elif n == "density":
@@ -330,52 +330,52 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                         triangulation_update_period += 2
 
                 # Densify
-                iters_since_update += 1
-                if i + 1 >= pipeline_args.densify_from:
-                    iters_since_densification += 1
+                # iters_since_update += 1
+                # if i + 1 >= pipeline_args.densify_from:
+                #     iters_since_densification += 1
 
-                if (
-                    iters_since_densification == next_densification_after
-                    and model.primal_points.shape[0]
-                    < 0.9 * model.num_final_points
-                ):
-                    point_error, point_contribution = model.collect_error_map(
-                        train_data_handler, pipeline_args.white_background
-                    )
-                    model.prune_and_densify(
-                        point_error,
-                        point_contribution,
-                        pipeline_args.densify_factor,
-                    )
+                # if (
+                #     iters_since_densification == next_densification_after
+                #     and model.primal_points.shape[0]
+                #     < 0.9 * model.num_final_points
+                # ):
+                #     point_error, point_contribution = model.collect_error_map(
+                #         train_data_handler, pipeline_args.white_background
+                #     )
+                #     model.prune_and_densify(
+                #         point_error,
+                #         point_contribution,
+                #         pipeline_args.densify_factor,
+                #     )
 
-                    model.update_triangulation(incremental=False)
-                    triangulation_update_period = 1
-                    gc.collect()
+                #     model.update_triangulation(incremental=False)
+                #     triangulation_update_period = 1
+                #     gc.collect()
 
-                    # Linear growth
-                    iters_since_densification = 0
-                    next_densification_after = int(
-                        (
-                            (pipeline_args.densify_factor - 1)
-                            * model.primal_points.shape[0]
-                            * (
-                                pipeline_args.densify_until
-                                - pipeline_args.densify_from
-                            )
-                        )
-                        / (model.num_final_points - model.num_init_points)
-                    )
-                    next_densification_after = max(
-                        next_densification_after, 100
-                    )
+                #     # Linear growth
+                #     iters_since_densification = 0
+                #     next_densification_after = int(
+                #         (
+                #             (pipeline_args.densify_factor - 1)
+                #             * model.primal_points.shape[0]
+                #             * (
+                #                 pipeline_args.densify_until
+                #                 - pipeline_args.densify_from
+                #             )
+                #         )
+                #         / (model.num_final_points - model.num_init_points)
+                #     )
+                #     next_densification_after = max(
+                #         next_densification_after, 100
+                #     )
 
-                    # TODO
-                    if True:
-                        for k in param_mu.keys():
-                            param_mu[k] = None
-                            param_sigma[k] = None
-                            param_count[k] = None
-                        stats_initialized = False
+                #     # TODO
+                #     if True:
+                #         for k in param_mu.keys():
+                #             param_mu[k] = None
+                #             param_sigma[k] = None
+                #             param_count[k] = None
+                #         stats_initialized = False
 
                 # Freeze points
                 if i == optimizer_args.freeze_points:
