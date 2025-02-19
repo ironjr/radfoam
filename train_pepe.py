@@ -239,7 +239,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
 
                 # Update sequential statistics
                 for n, p in model.named_parameters():
-                    g = p.grad.data.clone().cpu()
+                    g = p.grad.data.clone()
                     
                     if not stats_initialized:
                         param_mu[n] = g
@@ -261,7 +261,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                         count = param_count[n]
                         if count > 1:
                             mu = param_mu[n]
-                            p.grad.data = mu.to(p.device) * 1e4
+                            p.grad.data = mu.to(p.device) * 1e2
 
                             # variance = param_sigma[n] - param_mu[n].pow(2)  # Compute variance
                             # variance = torch.clamp(variance, min=min_variance_threshold)
@@ -271,8 +271,10 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                             # current_lr = model.xyz_scheduler_args(i)  # Get current learning rate
                             # gn_update = mu / (variance + damping_factor)
                             # p.grad.data = (current_lr * gn_update).to(p.device)
+
+                            p.data.sub_(p.grad.data)
                     
-                    model.optimizer.step()
+                    # model.optimizer.step()
                     
                     # Reset statistics after update
                     if args.reset_stats_after_update:
