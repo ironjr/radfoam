@@ -106,6 +106,10 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
         max_iterations=pipeline_args.iterations,
     )
 
+    # Add after model initialization
+    damping_factor = args.damping_factor  # Adjustable Tikhonov regularization
+    min_variance_threshold = args.min_variance_threshold  # Prevent division by zero
+
     def test_render(
         test_data_handler, ray_batch_fetcher, rgb_batch_fetcher, debug=False
     ):
@@ -171,10 +175,10 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
         # - model.att_dc: (num_points, 3)
         # - model.att_sh: (num_points, 3 * ((sh_degree + 1) ** 2 - 1))
         num_cameras = train_data_handler.cameras.shape[0]
-        grad_queue = {
-            n: deque(maxlen=num_cameras)
-            for n, p in model.named_parameters()
-        }
+        stats_initialized = False
+        param_mu = {n: None for n, _ in model.named_parameters()}
+        param_sigma = {n: None for n, _ in model.named_parameters()}
+        param_count = {n: None for n, _ in model.named_parameters()}
 
         with tqdm.trange(pipeline_args.iterations) as train:
             for i in train:
@@ -233,30 +237,50 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 event.synchronize()
                 ray_batch, rgb_batch = next(data_iterator)
 
-                # Update gradient queues
+                # Update sequential statistics
                 for n, p in model.named_parameters():
-                    grad_queue[n].append(p.grad.data.clone().cpu())
-                # import pdb; pdb.set_trace()
+                    g = p.grad.data.clone().cpu()
+                    
+                    if not stats_initialized:
+                        param_mu[n] = g
+                        param_sigma[n] = g.pow(2)  # Use squared gradients for GN approximation
+                        param_count[n] = 1
+                    else:
+                        count = param_count[n]
+                        # Update mean
+                        param_mu[n] = param_mu[n] * (count / (count + 1)) + g / (count + 1)
+                        # Update squared gradients
+                        param_sigma[n] = param_sigma[n] * (count / (count + 1)) + g.pow(2) / (count + 1)
+                        param_count[n] += 1
+                if not stats_initialized:
+                    stats_initialized = True
 
-                # Update parameters
-                if False:
+                # Update parameters using Gauss-Newton
+                if (i + 1) % num_cameras == 0:
+                    for n, p in model.named_parameters():
+                        count = param_count[n]
+                        if count > 1:
+                            mu = param_mu[n]
+                            p.grad.data = mu.to(p.device) * 1e4
+
+                            # variance = param_sigma[n] - param_mu[n].pow(2)  # Compute variance
+                            # variance = torch.clamp(variance, min=min_variance_threshold)
+                            
+                            # Compute GN update: H⁻¹g where H ≈ J^T J + λI
+                            # Using variance as diagonal approximation of J^T J
+                            # current_lr = model.xyz_scheduler_args(i)  # Get current learning rate
+                            # gn_update = mu / (variance + damping_factor)
+                            # p.grad.data = (current_lr * gn_update).to(p.device)
+                    
                     model.optimizer.step()
-                else:
-                    if (i + 1) % num_cameras == 0 and len(grad_queue['primal_points']) > 0:
-                        for n, p in model.named_parameters():
-                            g = torch.stack(list(grad_queue[n]))  # (num_cameras, num_points, num_params)
-                            # mu = g.mean(dim=0)  # (num_points, num_params)
-                            mu = g.sum(dim=0)  # (num_points, num_params)
-                            # sigma = g.std(dim=0)  # (num_points, num_params)
-
-                            # Sigma = g - mu[None]  # (num_cameras, num_points, num_params)
-                            # Sigma = torch.einsum('cpd,cpe->pde', Sigma, Sigma) / (Sigma.shape[0] - 1)  # (num_points, num_params, num_params)
-                            # Sigma = Sigma + 1e-6 * torch.eye(Sigma.shape[-1])[None]
-                            # Sigma = Sigma.inverse()
-
-                            p.grad.data = mu.to(p.device)
-                            # p.data.sub_(p.grad.data)
-                            model.optimizer.step()
+                    
+                    # Reset statistics after update
+                    if args.reset_stats_after_update:
+                        stats_initialized = False
+                        for k in param_mu.keys():
+                            param_mu[k] = None
+                            param_sigma[k] = None
+                            param_count[k] = None
 
                 model.update_learning_rate(i)
 
@@ -337,8 +361,11 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
 
                     # TODO
                     if True:
-                        for k in grad_queue.keys():
-                            grad_queue[k].clear()
+                        for k in param_mu.keys():
+                            param_mu[k] = None
+                            param_sigma[k] = None
+                            param_count[k] = None
+                        stats_initialized = False
 
                 # Freeze points
                 if i == optimizer_args.freeze_points:
@@ -384,6 +411,11 @@ def main():
     parser.add_argument(
         "-c", "--config", is_config_file=True, help="Path to config file"
     )
+
+    # Add new arguments
+    parser.add_argument('--damping_factor', type=float, default=0.1)
+    parser.add_argument('--min_variance_threshold', type=float, default=1e-6)
+    parser.add_argument('--reset_stats_after_update', type=bool, default=False)
 
     # Parse arguments
     args = parser.parse_args()
