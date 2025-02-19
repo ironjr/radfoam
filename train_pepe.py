@@ -42,6 +42,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
         out_dir = f"output/{experiment_name}"
         writer = SummaryWriter(out_dir, purge_step=0)
         os.makedirs(f"{out_dir}/test", exist_ok=True)
+        print(f"Output directory: {out_dir}")
 
         def represent_list_inline(dumper, data):
             return dumper.represent_sequence(
