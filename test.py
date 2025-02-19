@@ -81,7 +81,8 @@ def test(args, pipeline_args, model_args, optimizer_args, dataset_args):
         average_psnr = sum(psnr_list) / len(psnr_list)
 
         f = open(f"{checkpoint}/metrics.txt", "w")
-        f.write(f"Average PSNR: {average_psnr}")
+        f.write(f"Average PSNR: {average_psnr}\n")
+        f.write(f"Number of points: {model.primal_points.shape[0]}")
         f.close()
 
         return average_psnr
