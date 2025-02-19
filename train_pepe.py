@@ -241,7 +241,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 if False:
                     model.optimizer.step()
                 else:
-                    if (i + 1) % num_cameras == 0:
+                    if (i + 1) % num_cameras == 0 and len(grad_queue['primal_points']) > 0:
                         for n, p in model.named_parameters():
                             g = torch.stack(list(grad_queue[n]))  # (num_cameras, num_points, num_params)
                             # mu = g.mean(dim=0)  # (num_points, num_params)
@@ -333,6 +333,11 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     next_densification_after = max(
                         next_densification_after, 100
                     )
+
+                    # TODO
+                    if True:
+                        for k in grad_queue.keys():
+                            grad_queue[k].clear()
 
                 # Freeze points
                 if i == optimizer_args.freeze_points:
