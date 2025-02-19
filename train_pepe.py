@@ -272,7 +272,15 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                             # gn_update = mu / (variance + damping_factor)
                             # p.grad.data = (current_lr * gn_update).to(p.device)
 
-                            p.data.sub_(p.grad.data)
+                            learning_rate = 1e2
+                            if n == "primal_points":
+                                learning_rate *= model.xyz_scheduler_args(i)
+                            elif n == "density":
+                                learning_rate *= model.den_scheduler_args(i)
+                            elif n == "att_dc":
+                                learning_rate *= model.attr_dc_scheduler_args(i)
+                            print(f"Param: {n}, Learning rate: {learning_rate}")
+                            p.data.sub_(p.grad.data * learning_rate)
                     
                     # model.optimizer.step()
                     
