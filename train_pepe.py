@@ -16,13 +16,9 @@ from torch.utils.tensorboard import SummaryWriter
 
 from data_loader import DataHandler
 from configs import *
-# from radfoam_model.scene import RadFoamScene
 from radfoam_model.scene_noop import RadFoamScene
 from radfoam_model.utils import psnr
 import radfoam
-
-# New
-from collections import deque
 
 
 seed = 42
@@ -106,10 +102,6 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
         max_iterations=pipeline_args.iterations,
     )
 
-    # Add after model initialization
-    damping_factor = args.damping_factor  # Adjustable Tikhonov regularization
-    min_variance_threshold = args.min_variance_threshold  # Prevent division by zero
-
     def test_render(
         test_data_handler, ray_batch_fetcher, rgb_batch_fetcher, debug=False
     ):
@@ -168,18 +160,6 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
         iters_since_densification = 0
         next_densification_after = 1
 
-        # Gradient queues temporarily placed here.
-        # Parameters:
-        # - model.primal_points: (num_points, 3)
-        # - model.density: (num_points, 1)
-        # - model.att_dc: (num_points, 3)
-        # - model.att_sh: (num_points, 3 * ((sh_degree + 1) ** 2 - 1))
-        num_cameras = train_data_handler.cameras.shape[0]
-        stats_initialized = False
-        param_mu = {n: None for n, _ in model.named_parameters()}
-        param_sigma = {n: None for n, _ in model.named_parameters()}
-        param_count = {n: None for n, _ in model.named_parameters()}
-
         with tqdm.trange(pipeline_args.iterations) as train:
             for i in train:
                 if viewer is not None:
@@ -212,8 +192,6 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 else:
                     rgb_output = rgba_output[..., :3]
 
-
-                # Compute losses
                 color_loss = rgb_loss(rgb_batch, rgb_output)
                 opacity_loss = ((1 - opacity) ** 2).mean()
 
@@ -226,8 +204,6 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
 
                 loss = color_loss.mean() + opacity_loss + w_depth * quant_loss
 
-
-                # Optimize
                 model.optimizer.zero_grad(set_to_none=True)
 
                 # Hide latency of data loading behind the backward pass
@@ -237,65 +213,9 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 event.synchronize()
                 ray_batch, rgb_batch = next(data_iterator)
 
-                # Update sequential statistics
-                for n, p in model.named_parameters():
-                    g = p.grad.data.clone()
-                    
-                    if not stats_initialized:
-                        param_mu[n] = g
-                        param_sigma[n] = g.pow(2)  # Use squared gradients for GN approximation
-                        param_count[n] = 1
-                    else:
-                        count = param_count[n]
-                        # Update mean
-                        param_mu[n] = param_mu[n] * (count / (count + 1)) + g / (count + 1)
-                        # Update squared gradients
-                        param_sigma[n] = param_sigma[n] * (count / (count + 1)) + g.pow(2) / (count + 1)
-                        param_count[n] += 1
-                if not stats_initialized:
-                    stats_initialized = True
-
-                # Update parameters using Gauss-Newton
-                if (i + 1) % num_cameras == 0:
-                    for n, p in model.named_parameters():
-                        count = param_count[n]
-                        if count > 1:
-                            mu = param_mu[n]
-                            p.grad.data = mu.to(p.device)
-
-                            # variance = param_sigma[n] - param_mu[n].pow(2)  # Compute variance
-                            # variance = torch.clamp(variance, min=min_variance_threshold)
-                            
-                            # Compute GN update: H⁻¹g where H ≈ J^T J + λI
-                            # Using variance as diagonal approximation of J^T J
-                            # current_lr = model.xyz_scheduler_args(i)  # Get current learning rate
-                            # gn_update = mu / (variance + damping_factor)
-                            # p.grad.data = (current_lr * gn_update).to(p.device)
-
-                            learning_rate = 1e4
-                            if n == "primal_points":
-                                learning_rate *= model.xyz_scheduler_args(i)
-                            elif n == "density":
-                                learning_rate *= model.den_scheduler_args(i)
-                            elif n == "att_dc":
-                                learning_rate *= model.attr_dc_scheduler_args(i)
-                            print(f"Param: {n}, Learning rate: {learning_rate}")
-                            p.data.sub_(p.grad.data * learning_rate)
-                    
-                    # model.optimizer.step()
-                    
-                    # Reset statistics after update
-                    if args.reset_stats_after_update:
-                        stats_initialized = False
-                        for k in param_mu.keys():
-                            param_mu[k] = None
-                            param_sigma[k] = None
-                            param_count[k] = None
-
+                model.optimizer.step()
                 model.update_learning_rate(i)
 
-
-                # Log metrics
                 train.set_postfix(color_loss=f"{color_loss.mean().item():.5f}")
 
                 if i % 100 == 99 and not pipeline_args.debug:
@@ -321,7 +241,6 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                         "lr/attr_lr", model.attr_dc_scheduler_args(i), i
                     )
 
-                # Update triangulation
                 if iters_since_update >= triangulation_update_period:
                     model.update_triangulation(incremental=True)
                     iters_since_update = 0
@@ -369,23 +288,12 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 #         next_densification_after, 100
                 #     )
 
-                #     # TODO
-                #     if True:
-                #         for k in param_mu.keys():
-                #             param_mu[k] = None
-                #             param_sigma[k] = None
-                #             param_count[k] = None
-                #         stats_initialized = False
-
-                # Freeze points
                 if i == optimizer_args.freeze_points:
                     model.update_triangulation(incremental=False)
 
-                # Break if viewer is closed
                 if viewer is not None and viewer.is_closed():
                     break
 
-        # Save scene and model
         model.save_ply(f"{out_dir}/scene.ply")
         model.save_pt(f"{out_dir}/model.pt")
         del data_iterator
@@ -421,11 +329,6 @@ def main():
     parser.add_argument(
         "-c", "--config", is_config_file=True, help="Path to config file"
     )
-
-    # Add new arguments
-    parser.add_argument('--damping_factor', type=float, default=0.1)
-    parser.add_argument('--min_variance_threshold', type=float, default=1e-6)
-    parser.add_argument('--reset_stats_after_update', type=bool, default=False)
 
     # Parse arguments
     args = parser.parse_args()

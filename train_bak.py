@@ -160,7 +160,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
         iters_since_densification = 0
         next_densification_after = 1
 
-        with tqdm.trange(pipeline_args.iterations, dynamic_ncols=True) as train:
+        with tqdm.trange(pipeline_args.iterations) as train:
             for i in train:
                 if viewer is not None:
                     model.update_viewer(viewer)
@@ -192,28 +192,15 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 else:
                     rgb_output = rgba_output[..., :3]
 
-                # color_loss = rgb_loss(rgb_batch, rgb_output)
-                # opacity_loss = ((1 - opacity) ** 2).mean()
+                color_loss = rgb_loss(rgb_batch, rgb_output)
+                opacity_loss = ((1 - opacity) ** 2).mean()
 
                 valid_depth_mask = (depth > 0).all(dim=-1)
-                # quant_loss = (depth[..., 0] - depth[..., 1]).abs()
-                # quant_loss = (quant_loss * valid_depth_mask).mean()
+                quant_loss = (depth[..., 0] - depth[..., 1]).abs()
+                quant_loss = (quant_loss * valid_depth_mask).mean()
                 w_depth = pipeline_args.quantile_weight * min(
                     2 * i / pipeline_args.iterations, 1
                 )
-
-                # Get the original per-sample energies
-                color_loss_per_sample = rgb_loss(rgb_batch, rgb_output).mean(dim=-1)
-                opacity_loss_per_sample = ((1 - opacity) ** 2).mean(dim=-1)
-                quant_loss_per_sample = (depth[..., 0] - depth[..., 1]).abs() * valid_depth_mask
-                
-                energy_per_sample = (
-                    color_loss_per_sample + opacity_loss_per_sample + w_depth * quant_loss_per_sample
-                )
-
-                color_loss = color_loss_per_sample.mean()
-                opacity_loss = opacity_loss_per_sample.mean()
-                quant_loss = quant_loss_per_sample.mean()
 
                 # Calculate negative log probability (energy)
                 energy = color_loss.mean() + opacity_loss + w_depth * quant_loss
@@ -223,24 +210,27 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     name: param.clone()
                     for name, param in model.named_parameters()
                 }
-                current_states = {}
-                for param in model.parameters():
-                    if param in model.optimizer.state:
-                        current_states[param] = {
-                            key: value.clone() if torch.is_tensor(value) else value
-                            for key, value in model.optimizer.state[param].items()
-                        }
+                current_states = {
+                    'momentum': {
+                        name: state['momentum_buffer'].clone() if 'momentum_buffer' in state else None
+                        for name, state in model.optimizer.state.items()
+                    },
+                    'exp_avg': {
+                        name: state['exp_avg'].clone() if 'exp_avg' in state else None
+                        for name, state in model.optimizer.state.items()
+                    },
+                    'exp_avg_sq': {
+                        name: state['exp_avg_sq'].clone() if 'exp_avg_sq' in state else None
+                        for name, state in model.optimizer.state.items()
+                    }
+                }
 
                 # Regular optimizer step (becomes the proposal)
-                event = torch.cuda.Event()
-                event.record()
                 model.optimizer.zero_grad(set_to_none=True)
                 energy.backward()
-                event.synchronize()
-                ray_batch, rgb_batch = next(data_iterator)
                 model.optimizer.step()
 
-                # Calculate batch-wise energy at proposed state
+                # Calculate energy at proposed state
                 with torch.no_grad():
                     rgba_output_prop, depth_prop, _, _, _ = model(
                         ray_batch,
@@ -253,60 +243,50 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     else:
                         rgb_output_prop = rgba_output_prop[..., :3]
 
-                    # Calculate per-sample losses
-                    color_loss_prop = rgb_loss(rgb_batch, rgb_output_prop).mean(dim=-1)  # Shape: (N,)
-                    opacity_loss_prop = ((1 - opacity_prop) ** 2).mean(dim=-1)  # Shape: (N,)
-                    quant_loss_prop = ((depth_prop[..., 0] - depth_prop[..., 1]).abs() * valid_depth_mask)  # Shape: (N,)
+                    color_loss_prop = rgb_loss(rgb_batch, rgb_output_prop)
+                    opacity_loss_prop = ((1 - opacity_prop) ** 2).mean()
+                    quant_loss_prop = (depth_prop[..., 0] - depth_prop[..., 1]).abs()
+                    quant_loss_prop = (quant_loss_prop * valid_depth_mask).mean()
                     
-                    energy_prop_per_sample = (
-                        color_loss_prop + opacity_loss_prop + w_depth * quant_loss_prop
-                    )  # Shape: (N,)
+                    energy_prop = (
+                        color_loss_prop.mean() + opacity_loss_prop + w_depth * quant_loss_prop
+                    )
 
-                # Calculate acceptance probability per sample
+                # Calculate acceptance probability
                 temperature = 1.0  # Can be adjusted as hyperparameter
                 accept_prob = torch.min(
-                    torch.ones_like(energy_per_sample),
-                    torch.exp((energy_per_sample - energy_prop_per_sample) / temperature)
-                )  # Shape: (N,)
+                    torch.tensor(1.0),
+                    torch.exp((energy - energy_prop) / temperature)
+                )
 
-                # Generate random numbers for acceptance
-                random_numbers = torch.rand_like(accept_prob)
-                accepted_mask = (random_numbers < accept_prob)  # Shape: (N,)
+                # Accept or reject
+                if torch.rand(1) < accept_prob:
+                    # Accept: Keep proposed state
+                    accepted = True
+                else:
+                    # Reject: Revert to previous state
+                    accepted = False
+                    with torch.no_grad():
+                        for name, param in model.named_parameters():
+                            param.copy_(current_params[name])
+                        
+                        # Restore optimizer states
+                        for name, state in model.optimizer.state.items():
+                            if 'momentum_buffer' in state and current_states['momentum'][name] is not None:
+                                state['momentum_buffer'].copy_(current_states['momentum'][name])
+                            if 'exp_avg' in state and current_states['exp_avg'][name] is not None:
+                                state['exp_avg'].copy_(current_states['exp_avg'][name])
+                            if 'exp_avg_sq' in state and current_states['exp_avg_sq'][name] is not None:
+                                state['exp_avg_sq'].copy_(current_states['exp_avg_sq'][name])
 
-                # Reject: Revert parameters selectively based on accepted_mask
-                with torch.no_grad():
-                    for name, param in model.named_parameters():
-                        if param.shape[0] == accepted_mask.shape[0]:  # Only for parameters with batch dimension
-                            # Expand accepted_mask to match parameter shape
-                            mask_expanded = accepted_mask.view(-1, *([1] * (param.dim() - 1)))
-                            # Selectively update parameters
-                            param.data = torch.where(
-                                mask_expanded,
-                                param.data,
-                                current_params[name]
-                            )
-                            
-                            # Selectively update optimizer states
-                            if param in current_states:
-                                for key, value in current_states[param].items():
-                                    if torch.is_tensor(value) and value.shape[0] == accepted_mask.shape[0]:
-                                        mask_expanded = accepted_mask.view(-1, *([1] * (value.dim() - 1)))
-                                        model.optimizer.state[param][key] = torch.where(
-                                            mask_expanded,
-                                            model.optimizer.state[param][key],
-                                            value
-                                        )
-
-                # Update learning rate
+                # Update learning rate (whether accepted or rejected)
                 model.update_learning_rate(i)
 
                 # Update progress bar
                 train.set_postfix({
                     'energy': energy.item(),
-                    'energy_prop': energy_prop_per_sample.mean().item(),
-                    'accept_prob': accept_prob.mean().item(),
-                    'mean_energy': energy_per_sample.mean().item(),
-                    'accept_rate': accepted_mask.float().mean().item()
+                    'accept_prob': accept_prob.item(),
+                    'accepted': accepted
                 })
 
                 if i % 100 == 99 and not pipeline_args.debug:

@@ -16,9 +16,13 @@ from torch.utils.tensorboard import SummaryWriter
 
 from data_loader import DataHandler
 from configs import *
-from radfoam_model.scene import RadFoamScene
+# from radfoam_model.scene import RadFoamScene
+from radfoam_model.scene_noop import RadFoamScene
 from radfoam_model.utils import psnr
 import radfoam
+
+# New
+from collections import deque
 
 
 seed = 42
@@ -102,6 +106,10 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
         max_iterations=pipeline_args.iterations,
     )
 
+    # Add after model initialization
+    damping_factor = args.damping_factor  # Adjustable Tikhonov regularization
+    min_variance_threshold = args.min_variance_threshold  # Prevent division by zero
+
     def test_render(
         test_data_handler, ray_batch_fetcher, rgb_batch_fetcher, debug=False
     ):
@@ -160,7 +168,19 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
         iters_since_densification = 0
         next_densification_after = 1
 
-        with tqdm.trange(pipeline_args.iterations, dynamic_ncols=True) as train:
+        # Gradient queues temporarily placed here.
+        # Parameters:
+        # - model.primal_points: (num_points, 3)
+        # - model.density: (num_points, 1)
+        # - model.att_dc: (num_points, 3)
+        # - model.att_sh: (num_points, 3 * ((sh_degree + 1) ** 2 - 1))
+        num_cameras = train_data_handler.cameras.shape[0]
+        stats_initialized = False
+        param_mu = {n: None for n, _ in model.named_parameters()}
+        param_sigma = {n: None for n, _ in model.named_parameters()}
+        param_count = {n: None for n, _ in model.named_parameters()}
+
+        with tqdm.trange(pipeline_args.iterations) as train:
             for i in train:
                 if viewer is not None:
                     model.update_viewer(viewer)
@@ -192,122 +212,106 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 else:
                     rgb_output = rgba_output[..., :3]
 
-                # color_loss = rgb_loss(rgb_batch, rgb_output)
-                # opacity_loss = ((1 - opacity) ** 2).mean()
+
+                # Compute losses
+                color_loss = rgb_loss(rgb_batch, rgb_output)
+                opacity_loss = ((1 - opacity) ** 2).mean()
 
                 valid_depth_mask = (depth > 0).all(dim=-1)
-                # quant_loss = (depth[..., 0] - depth[..., 1]).abs()
-                # quant_loss = (quant_loss * valid_depth_mask).mean()
+                quant_loss = (depth[..., 0] - depth[..., 1]).abs()
+                quant_loss = (quant_loss * valid_depth_mask).mean()
                 w_depth = pipeline_args.quantile_weight * min(
                     2 * i / pipeline_args.iterations, 1
                 )
 
-                # Get the original per-sample energies
-                color_loss_per_sample = rgb_loss(rgb_batch, rgb_output).mean(dim=-1)
-                opacity_loss_per_sample = ((1 - opacity) ** 2).mean(dim=-1)
-                quant_loss_per_sample = (depth[..., 0] - depth[..., 1]).abs() * valid_depth_mask
-                
-                energy_per_sample = (
-                    color_loss_per_sample + opacity_loss_per_sample + w_depth * quant_loss_per_sample
-                )
+                loss = color_loss.mean() + opacity_loss + w_depth * quant_loss
 
-                color_loss = color_loss_per_sample.mean()
-                opacity_loss = opacity_loss_per_sample.mean()
-                quant_loss = quant_loss_per_sample.mean()
 
-                # Calculate negative log probability (energy)
-                energy = color_loss.mean() + opacity_loss + w_depth * quant_loss
+                # Optimize
+                model.optimizer.zero_grad(set_to_none=True)
 
-                # Store current parameter values and optimizer states
-                current_params = {
-                    name: param.clone()
-                    for name, param in model.named_parameters()
-                }
-                current_states = {}
-                for param in model.parameters():
-                    if param in model.optimizer.state:
-                        current_states[param] = {
-                            key: value.clone() if torch.is_tensor(value) else value
-                            for key, value in model.optimizer.state[param].items()
-                        }
-
-                # Regular optimizer step (becomes the proposal)
+                # Hide latency of data loading behind the backward pass
                 event = torch.cuda.Event()
                 event.record()
-                model.optimizer.zero_grad(set_to_none=True)
-                energy.backward()
+                loss.backward()
                 event.synchronize()
                 ray_batch, rgb_batch = next(data_iterator)
-                model.optimizer.step()
 
-                # Calculate batch-wise energy at proposed state
-                with torch.no_grad():
-                    rgba_output_prop, depth_prop, _, _, _ = model(
-                        ray_batch,
-                        depth_quantiles=depth_quantiles,
-                    )
+                # Update sequential statistics
+                for n, p in model.named_parameters():
+                    g = p.grad.data.clone() * num_cameras
                     
-                    opacity_prop = rgba_output_prop[..., -1:]
-                    if pipeline_args.white_background:
-                        rgb_output_prop = rgba_output_prop[..., :3] + (1 - opacity_prop)
+                    if not stats_initialized:
+                        param_mu[n] = g
+                        param_sigma[n] = g.pow(2)  # Use squared gradients for GN approximation
+                        param_count[n] = 1
                     else:
-                        rgb_output_prop = rgba_output_prop[..., :3]
+                        count = param_count[n]
+                        # Update mean
+                        param_mu[n] = param_mu[n] * (count / (count + 1)) + g / (count + 1)
+                        # Update squared gradients
+                        param_sigma[n] = param_sigma[n] * (count / (count + 1)) + g.pow(2) / (count + 1)
+                        param_count[n] += 1
+                if not stats_initialized:
+                    stats_initialized = True
 
-                    # Calculate per-sample losses
-                    color_loss_prop = rgb_loss(rgb_batch, rgb_output_prop).mean(dim=-1)  # Shape: (N,)
-                    opacity_loss_prop = ((1 - opacity_prop) ** 2).mean(dim=-1)  # Shape: (N,)
-                    quant_loss_prop = ((depth_prop[..., 0] - depth_prop[..., 1]).abs() * valid_depth_mask)  # Shape: (N,)
-                    
-                    energy_prop_per_sample = (
-                        color_loss_prop + opacity_loss_prop + w_depth * quant_loss_prop
-                    )  # Shape: (N,)
-
-                # Calculate acceptance probability per sample
-                temperature = 1.0  # Can be adjusted as hyperparameter
-                accept_prob = torch.min(
-                    torch.ones_like(energy_per_sample),
-                    torch.exp((energy_per_sample - energy_prop_per_sample) / temperature)
-                )  # Shape: (N,)
-
-                # Generate random numbers for acceptance
-                random_numbers = torch.rand_like(accept_prob)
-                accepted_mask = (random_numbers < accept_prob)  # Shape: (N,)
-
-                # Reject: Revert parameters selectively based on accepted_mask
-                with torch.no_grad():
-                    for name, param in model.named_parameters():
-                        if param.shape[0] == accepted_mask.shape[0]:  # Only for parameters with batch dimension
-                            # Expand accepted_mask to match parameter shape
-                            mask_expanded = accepted_mask.view(-1, *([1] * (param.dim() - 1)))
-                            # Selectively update parameters
-                            param.data = torch.where(
-                                mask_expanded,
-                                param.data,
-                                current_params[name]
-                            )
+                # Update parameters using Gauss-Newton
+                # if (i + 1) % num_cameras == 0:
+                if True:
+                    for n, p in model.named_parameters():
+                        count = param_count[n]
+                        if count > 1:
+                            # p.grad.data = param_mu[n]
+                            mu = param_mu[n]
+                            variance = param_sigma[n] - param_mu[n].pow(2)  # Compute variance
+                            # import pdb; pdb.set_trace()
+                            variance = torch.clamp(variance, min=min_variance_threshold)
                             
-                            # Selectively update optimizer states
-                            if param in current_states:
-                                for key, value in current_states[param].items():
-                                    if torch.is_tensor(value) and value.shape[0] == accepted_mask.shape[0]:
-                                        mask_expanded = accepted_mask.view(-1, *([1] * (value.dim() - 1)))
-                                        model.optimizer.state[param][key] = torch.where(
-                                            mask_expanded,
-                                            model.optimizer.state[param][key],
-                                            value
-                                        )
+                            # Compute GN update: H⁻¹g where H ≈ J^T J + λI
+                            # Using variance as diagonal approximation of J^T J
+                            # current_lr = model.xyz_scheduler_args(i)  # Get current learning rate
+                            gn_update = mu / (variance + damping_factor)
+                            # p.grad.data = (current_lr * gn_update).to(p.device)
+                            p.grad.data = gn_update
 
-                # Update learning rate
+                            learning_rate = 0.1
+                            if n == "primal_points":
+                                learning_rate *= 0.01
+                            # elif n == "density":
+                            #     learning_rate *= model.den_scheduler_args(i)
+                            elif n == "att_dc":
+                                learning_rate *= 0.1
+                            elif n == "att_sh":
+                                learning_rate *= 0.1 * args.sh_factor
+
+                            # if n == "primal_points":
+                            #     learning_rate *= model.xyz_scheduler_args(i)
+                            # elif n == "density":
+                            #     learning_rate *= model.den_scheduler_args(i)
+                            # elif n == "att_dc":
+                            #     learning_rate *= model.attr_dc_scheduler_args(i)
+                            # elif n == "att_sh":
+                            #     learning_rate *= model.attr_rest_scheduler_args(i)
+                            print(f"Param: {n}, Learning rate: {learning_rate}, Variance: {variance.min()}, GN update: {gn_update.abs().max()}"
+                                  f"Grad Size: {p.grad.data.abs().max()}")
+                            p.data.sub_(p.grad.data * learning_rate)
+                    
+                    # model.optimizer.step()
+                    
+                    # Reset statistics after update
+                    # if args.reset_stats_after_update:
+                    if (i + 1) % num_cameras == 0:
+                        stats_initialized = False
+                        for k in param_mu.keys():
+                            param_mu[k] = None
+                            param_sigma[k] = None
+                            param_count[k] = None
+
                 model.update_learning_rate(i)
 
-                # Update progress bar
-                train.set_postfix({
-                    'energy': energy.item(),
-                    'energy_prop': energy_prop_per_sample.mean().item(),
-                    'accept_prob': accept_prob.mean().item(),
-                    'mean_energy': energy_per_sample.mean().item(),
-                    'accept_rate': accepted_mask.float().mean().item()
-                })
+
+                # Log metrics
+                train.set_postfix(color_loss=f"{color_loss.mean().item():.5f}")
 
                 if i % 100 == 99 and not pipeline_args.debug:
                     writer.add_scalar("train/rgb_loss", color_loss.mean(), i)
@@ -332,6 +336,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                         "lr/attr_lr", model.attr_dc_scheduler_args(i), i
                     )
 
+                # Update triangulation
                 if iters_since_update >= triangulation_update_period:
                     model.update_triangulation(incremental=True)
                     iters_since_update = 0
@@ -339,51 +344,63 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     if triangulation_update_period < 100:
                         triangulation_update_period += 2
 
-                iters_since_update += 1
-                if i + 1 >= pipeline_args.densify_from:
-                    iters_since_densification += 1
+                # Densify
+                # iters_since_update += 1
+                # if i + 1 >= pipeline_args.densify_from:
+                #     iters_since_densification += 1
 
-                if (
-                    iters_since_densification == next_densification_after
-                    and model.primal_points.shape[0]
-                    < 0.9 * model.num_final_points
-                ):
-                    point_error, point_contribution = model.collect_error_map(
-                        train_data_handler, pipeline_args.white_background
-                    )
-                    model.prune_and_densify(
-                        point_error,
-                        point_contribution,
-                        pipeline_args.densify_factor,
-                    )
+                # if (
+                #     iters_since_densification == next_densification_after
+                #     and model.primal_points.shape[0]
+                #     < 0.9 * model.num_final_points
+                # ):
+                #     point_error, point_contribution = model.collect_error_map(
+                #         train_data_handler, pipeline_args.white_background
+                #     )
+                #     model.prune_and_densify(
+                #         point_error,
+                #         point_contribution,
+                #         pipeline_args.densify_factor,
+                #     )
 
-                    model.update_triangulation(incremental=False)
-                    triangulation_update_period = 1
-                    gc.collect()
+                #     model.update_triangulation(incremental=False)
+                #     triangulation_update_period = 1
+                #     gc.collect()
 
-                    # Linear growth
-                    iters_since_densification = 0
-                    next_densification_after = int(
-                        (
-                            (pipeline_args.densify_factor - 1)
-                            * model.primal_points.shape[0]
-                            * (
-                                pipeline_args.densify_until
-                                - pipeline_args.densify_from
-                            )
-                        )
-                        / (model.num_final_points - model.num_init_points)
-                    )
-                    next_densification_after = max(
-                        next_densification_after, 100
-                    )
+                #     # Linear growth
+                #     iters_since_densification = 0
+                #     next_densification_after = int(
+                #         (
+                #             (pipeline_args.densify_factor - 1)
+                #             * model.primal_points.shape[0]
+                #             * (
+                #                 pipeline_args.densify_until
+                #                 - pipeline_args.densify_from
+                #             )
+                #         )
+                #         / (model.num_final_points - model.num_init_points)
+                #     )
+                #     next_densification_after = max(
+                #         next_densification_after, 100
+                #     )
 
+                #     # TODO
+                #     if True:
+                #         for k in param_mu.keys():
+                #             param_mu[k] = None
+                #             param_sigma[k] = None
+                #             param_count[k] = None
+                #         stats_initialized = False
+
+                # Freeze points
                 if i == optimizer_args.freeze_points:
                     model.update_triangulation(incremental=False)
 
+                # Break if viewer is closed
                 if viewer is not None and viewer.is_closed():
                     break
 
+        # Save scene and model
         model.save_ply(f"{out_dir}/scene.ply")
         model.save_pt(f"{out_dir}/model.pt")
         del data_iterator
@@ -419,6 +436,11 @@ def main():
     parser.add_argument(
         "-c", "--config", is_config_file=True, help="Path to config file"
     )
+
+    # Add new arguments
+    parser.add_argument('--damping_factor', type=float, default=0.1)
+    parser.add_argument('--min_variance_threshold', type=float, default=1e-12)
+    parser.add_argument('--reset_stats_after_update', type=bool, default=False)
 
     # Parse arguments
     args = parser.parse_args()
