@@ -205,12 +205,14 @@ class RadFoamScene(torch.nn.Module):
     def get_primal_attributes(self):
         return torch.cat([self.att_dc, self.att_sh], dim=-1)
 
-    def get_trace_data(self):
+    def get_trace_data(self, keep_density=False):
         points = self.primal_points
-        attributes = torch.cat(
-            [self.get_primal_attributes(), self.get_primal_density()],
-            dim=-1,
-        ).to(self.attr_dtype)
+        density = self.get_primal_density()
+        if keep_density:
+            self.primal_density = density
+            self.primal_density.retain_grad()
+            density = self.primal_density
+        attributes = torch.cat([self.get_primal_attributes(), density], dim=-1).to(self.attr_dtype)
         point_adjacency = self.point_adjacency
         point_adjacency_offsets = self.point_adjacency_offsets
 
@@ -239,9 +241,10 @@ class RadFoamScene(torch.nn.Module):
         start_point=None,
         depth_quantiles=None,
         return_contribution=False,
+        return_statistics=False,
     ):
         points, attributes, point_adjacency, point_adjacency_offsets = (
-            self.get_trace_data()
+            self.get_trace_data(keep_density=return_statistics)
         )
 
         if start_point is None:
@@ -258,7 +261,46 @@ class RadFoamScene(torch.nn.Module):
             start_point,
             depth_quantiles,
             return_contribution,
+            return_statistics,
         )
+
+    def get_grad_stats(self):
+        if self.primal_points.grad is None:
+            return None
+
+        stats = TraceRays.get_gradient_statistics()
+        count = stats['point_grad_counts'][:, None]
+        mask = (count != 0)
+
+        point_grad = torch.where(mask, self.primal_points.grad / count, 0)
+        att_dc_grad = torch.where(mask, self.att_dc.grad / count, 0)
+        att_sh_grad = torch.where(mask, self.att_sh.grad / count, 0)
+        density_grad = torch.where(mask, self.primal_density.grad / count, 0)
+
+        point_grad_m2 = torch.where(mask, stats['point_grad_m2'] / count, 0)
+        att_dc_grad_m2 = torch.where(mask, stats['attr_grad_m2'][:, :self.att_dc.shape[1]] / count, 0)
+        att_sh_grad_m2 = torch.where(mask, stats['attr_grad_m2'][:, self.att_dc.shape[1]:-1] / count, 0)
+        density_grad_m2 = torch.where(mask, stats['attr_grad_m2'][:, -1:] / count, 0)
+
+        # TODO: Better way to compute the variance?
+        # Point gradients are always positive.
+        point_grad_var = (point_grad_m2 - point_grad.pow(2)).clip(min=0)
+        # Due to the floating point precision, ~1.8% of the attribute gradients are negative.
+        att_dc_grad_var = (att_dc_grad_m2 - att_dc_grad.pow(2)).clip(min=0)
+        att_sh_grad_var = (att_sh_grad_m2 - att_sh_grad.pow(2)).clip(min=0)
+        density_grad_var = (density_grad_m2 - density_grad.pow(2)).clip(min=0)
+
+        return {
+            'point_grad_counts': count,
+            'point_grad': point_grad,
+            'att_dc_grad': att_dc_grad,
+            'att_sh_grad': att_sh_grad,
+            'density_grad': density_grad,
+            'point_grad_var': point_grad_var,
+            'att_dc_grad_var': att_dc_grad_var,
+            'att_sh_grad_var': att_sh_grad_var,
+            'density_grad_var': density_grad_var,
+        }
 
     def update_viewer(self, viewer):
         points, attributes, point_adjacency, point_adjacency_offsets = (

@@ -149,10 +149,7 @@ __global__ void backward(TraceSettings settings,
                          Ray *__restrict__ ray_grad,
                          Vec3f *__restrict__ points_grad,
                          attr_scalar *__restrict__ attribute_grad,
-                         attr_scalar *__restrict__ point_error,
-                         Vec3f *__restrict__ points_grad_m2,  // For sum of squares of points_grad
-                         attr_scalar *__restrict__ attr_grad_m2,  // For sum of squares of attribute_grad
-                         uint32_t *__restrict__ point_counts) {  // For count of rays passing through each point
+                         attr_scalar *__restrict__ point_error) {
 
     uint32_t thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (thread_idx >= num_rays)
@@ -169,11 +166,6 @@ __global__ void backward(TraceSettings settings,
         depth_quantiles + thread_idx * num_depth_quantiles;
 
     auto sh_coeffs = sh_coefficients<sh_degree>(ray.direction);
-
-    auto sh_coeffs_sq = sh_coeffs;
-    if (point_counts) {
-        sh_coeffs_sq = sh_coeffs.cwiseProduct(sh_coeffs);
-    }
 
     auto load_attributes = [&](uint32_t v_idx, Vec3f &rgb, float &s) {
         const attr_scalar *attr_ptr = attributes + v_idx * attr_memory_size;
@@ -312,11 +304,6 @@ __global__ void backward(TraceSettings settings,
 
         if (prev_point_idx != UINT32_MAX) {
             atomic_add_vec(points_grad + prev_point_idx, prev_point_grad);
-            if (point_counts) {
-                Vec3f prev_point_grad_m2 = prev_point_grad.cwiseProduct(prev_point_grad);
-                atomicAdd(point_counts + prev_point_idx, 1u);
-                atomic_add_vec(points_grad_m2 + prev_point_idx, prev_point_grad_m2);
-            }
         }
         prev_point = current_point;
         prev_point_idx = point_idx;
@@ -332,9 +319,6 @@ __global__ void backward(TraceSettings settings,
                 dL_drgb_primal[i] = 0.0f;
             }
         }
-
-        __threadfence();
-
         write_rgb_grad_to_sh<attr_scalar, sh_degree>(
             sh_coeffs,
             dL_drgb_primal,
@@ -342,24 +326,6 @@ __global__ void backward(TraceSettings settings,
         atomicAdd(attribute_grad + point_idx * attr_memory_size +
                       (attr_memory_size - 1),
                   (attr_scalar)dL_ds_primal);
-
-        __threadfence();
-
-        Vec3f dL_drgb_primal_cached = dL_drgb_primal;
-        float dL_ds_primal_cached = dL_ds_primal;
-        if (point_counts) {
-            Vec3f dL_drgb_primal_sq = dL_drgb_primal_cached.cwiseProduct(dL_drgb_primal_cached);
-
-            __threadfence();
-
-            write_rgb_grad_to_sh<attr_scalar, sh_degree>(
-                sh_coeffs_sq,
-                dL_drgb_primal_sq,
-                attr_grad_m2 + point_idx * attr_memory_size);
-            atomicAdd(attr_grad_m2 + point_idx * attr_memory_size +
-                          (attr_memory_size - 1),
-                      (attr_scalar)(dL_ds_primal_cached * dL_ds_primal_cached));
-        }
 
         return transmittance > settings.weight_threshold;
     };
@@ -696,10 +662,7 @@ class CUDATracingPipeline : public Pipeline {
                         Ray *ray_grad,
                         Vec3f *points_grad,
                         void *attribute_grad,
-                        void *point_error,
-                        Vec3f *points_grad_m2,
-                        void *attr_grad_m2,
-                        uint32_t *point_counts) override {
+                        void *point_error) override {
 
         CUDAArray<Vec4h> adjacent_diff(point_adjacency_size + 32);
         prefetch_adjacent_diff(reinterpret_cast<const Vec3f *>(points),
@@ -734,10 +697,7 @@ class CUDATracingPipeline : public Pipeline {
             ray_grad,
             points_grad,
             static_cast<attr_scalar *>(attribute_grad),
-            static_cast<attr_scalar *>(point_error),
-            points_grad_m2,
-            static_cast<attr_scalar *>(attr_grad_m2),
-            point_counts);
+            static_cast<attr_scalar *>(point_error));
     }
 
     void trace_visualization(const TraceSettings &settings,

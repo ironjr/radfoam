@@ -278,8 +278,7 @@ py::object trace_backward(Pipeline &self,
                           std::optional<torch::Tensor> depth_grad_in,
                           std::optional<torch::Tensor> ray_error_in,
                           py::object weight_threshold,
-                          py::object max_intersections,
-                          bool return_grad_stats) {
+                          py::object max_intersections) {
     torch::Tensor points = points_in.contiguous();
     torch::Tensor attributes = attributes_in.contiguous();
     torch::Tensor point_adjacency = point_adjacency_in.contiguous();
@@ -455,19 +454,6 @@ py::object trace_backward(Pipeline &self,
 
     torch::Tensor ray_grad = torch::empty_like(rays);
 
-    // Create additional tensors for gradient statistics if requested
-    torch::Tensor points_grad_m2, attr_grad_m2, ray_grad_m2;
-    torch::Tensor point_counts, ray_counts;
-    
-    if (return_grad_stats) {
-        points_grad_m2 = torch::zeros_like(points_grad);
-        attr_grad_m2 = torch::zeros_like(attr_grad);
-        
-        point_counts = torch::zeros(
-            {num_points}, 
-            torch::dtype(torch::kUInt32).device(rays.device()));
-    }
-
     set_default_stream();
 
     self.trace_backward(
@@ -496,10 +482,7 @@ py::object trace_backward(Pipeline &self,
         reinterpret_cast<radfoam::Ray *>(ray_grad.data_ptr()),
         reinterpret_cast<radfoam::Vec3f *>(points_grad.data_ptr()),
         attr_grad.data_ptr(),
-        return_error ? point_error.data_ptr() : nullptr,
-        return_grad_stats ? reinterpret_cast<radfoam::Vec3f *>(points_grad_m2.data_ptr()) : nullptr,
-        return_grad_stats ? attr_grad_m2.data_ptr() : nullptr,
-        return_grad_stats ? reinterpret_cast<uint32_t *>(point_counts.data_ptr()) : nullptr);
+        return_error ? point_error.data_ptr() : nullptr);
 
     py::dict output_dict;
 
@@ -508,12 +491,6 @@ py::object trace_backward(Pipeline &self,
     output_dict["ray_grad"] = ray_grad;
     if (return_error) {
         output_dict["point_error"] = point_error;
-    }
-
-    if (return_grad_stats) {
-        output_dict["point_grad_m2"] = points_grad_m2;
-        output_dict["attr_grad_m2"] = attr_grad_m2;
-        output_dict["point_grad_counts"] = point_counts;
     }
 
     return output_dict;
@@ -675,8 +652,7 @@ void init_pipeline_bindings(py::module &module) {
              py::arg("depth_grad_in") = py::none(),
              py::arg("ray_error") = py::none(),
              py::arg("weight_threshold") = py::none(),
-             py::arg("max_intersections") = py::none(),
-             py::arg("return_grad_stats") = false)
+             py::arg("max_intersections") = py::none())
         .def("trace_benchmark",
              trace_benchmark,
              py::arg("points"),

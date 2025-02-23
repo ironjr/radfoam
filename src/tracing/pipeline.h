@@ -97,7 +97,10 @@ class Pipeline {
                                 Ray *ray_grad,
                                 Vec3f *points_grad,
                                 void *attribute_grad,
-                                void *point_error) = 0;
+                                void *point_error,
+                                Vec3f *points_grad_m2,
+                                void *attr_grad_m2,
+                                uint32_t *point_counts) = 0;
 
     virtual void trace_visualization(const TraceSettings &settings,
                                      const VisualizationSettings &vis_settings,

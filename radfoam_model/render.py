@@ -8,6 +8,8 @@ class ErrorBox:
 
 
 class TraceRays(torch.autograd.Function):
+    _latest_ctx = None
+    
     @staticmethod
     def forward(
         ctx,
@@ -19,7 +21,8 @@ class TraceRays(torch.autograd.Function):
         rays,
         start_point,
         depth_quantiles,
-        return_contribution,
+        return_contribution=False,
+        return_statistics=False,
     ):
         ctx.rays = rays
         ctx.start_point = start_point
@@ -29,6 +32,10 @@ class TraceRays(torch.autograd.Function):
         ctx.attributes = _attributes
         ctx.point_adjacency = _point_adjacency
         ctx.point_adjacency_offsets = _point_adjacency_offsets
+        ctx.return_statistics = return_statistics
+
+        if return_statistics:
+            TraceRays._latest_ctx = ctx
 
         results = pipeline.trace_forward(
             _points,
@@ -76,6 +83,7 @@ class TraceRays(torch.autograd.Function):
         _point_adjacency = ctx.point_adjacency
         _point_adjacency_offsets = ctx.point_adjacency_offsets
         depth_quantiles = ctx.depth_quantiles
+        return_statistics = ctx.return_statistics
 
         results = pipeline.trace_backward(
             _points,
@@ -90,11 +98,19 @@ class TraceRays(torch.autograd.Function):
             ctx.depth_indices,
             grad_depth,
             ctx.errbox.ray_error,
+            return_grad_stats=return_statistics,
         )
         points_grad = results["points_grad"]
         attr_grad = results["attr_grad"]
         ctx.errbox.point_error = results.get("point_error", None)
 
+        # Get gradient statistics if computed
+        if ctx.return_statistics:
+            ctx.point_grad_m2 = results["point_grad_m2"]
+            ctx.attr_grad_m2 = results["attr_grad_m2"]
+            ctx.point_grad_counts = results["point_grad_counts"]
+
+        # Zero out non-finite gradients
         points_grad[~points_grad.isfinite()] = 0
         attr_grad[~attr_grad.isfinite()] = 0
 
@@ -119,4 +135,24 @@ class TraceRays(torch.autograd.Function):
             None,  # start_point
             None,  # depth_quantiles
             None,  # return_contribution
+            None,  # return_statistics
         )
+
+    @staticmethod
+    def get_gradient_statistics(ctx=None):
+        """Helper method to access gradient statistics after backward pass"""
+        if ctx is None:
+            ctx = TraceRays._latest_ctx
+        if not hasattr(ctx, 'return_statistics') or not ctx.return_statistics:
+            return None
+        
+        # Zero out non-finite gradients
+        point_grad_m2 = ctx.point_grad_m2
+        attr_grad_m2 = ctx.attr_grad_m2
+        point_grad_m2[~point_grad_m2.isfinite()] = 0
+        attr_grad_m2[~attr_grad_m2.isfinite()] = 0
+        return {
+            "point_grad_m2": point_grad_m2,
+            "attr_grad_m2": attr_grad_m2,
+            "point_grad_counts": ctx.point_grad_counts,
+        }
