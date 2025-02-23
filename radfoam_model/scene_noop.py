@@ -240,7 +240,7 @@ class RadFoamScene(torch.nn.Module):
         rays,
         start_point=None,
         depth_quantiles=None,
-        return_contribution=False,
+        weight_contribution=None,
         return_statistics=False,
     ):
         points, attributes, point_adjacency, point_adjacency_offsets = (
@@ -260,7 +260,7 @@ class RadFoamScene(torch.nn.Module):
             rays,
             start_point,
             depth_quantiles,
-            return_contribution,
+            weight_contribution,
             return_statistics,
         )
 

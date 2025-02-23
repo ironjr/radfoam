@@ -75,7 +75,9 @@ class Pipeline {
                                float *quantile_dpeths,
                                uint32_t *quantile_point_indices,
                                uint32_t *num_intersections,
-                               void *point_contribution) = 0;
+                               uint32_t contribution_size,
+                               void *point_contribution,
+                               const void *weight_contribution) = 0;
 
     virtual void trace_backward(const TraceSettings &settings,
                                 uint32_t num_points,

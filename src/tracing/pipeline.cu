@@ -27,7 +27,9 @@ __global__ void forward(TraceSettings settings,
                         float *__restrict__ quantile_depths,
                         uint32_t *__restrict__ quantile_point_indices,
                         uint32_t *__restrict__ num_intersections,
-                        attr_scalar *__restrict__ point_contribution) {
+                        uint32_t contribution_size,
+                        attr_scalar *__restrict__ point_contribution,
+                        const attr_scalar *__restrict__ weight_contribution) {
 
     uint32_t thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (thread_idx >= num_rays)
@@ -78,7 +80,10 @@ __global__ void forward(TraceSettings settings,
         float weight = transmittance * alpha;
 
         if (point_contribution) {
-            atomicAdd(point_contribution + point_idx, (attr_scalar)weight);
+            for (int d = 0; d < contribution_size; d++) {
+                atomicAdd(point_contribution + point_idx * contribution_size + d,
+                          (attr_scalar)(weight) * attr_scalar(weight_contribution[thread_idx * contribution_size + d]));
+            }
         }
         accumulated_rgb += weight * rgb_primal;
 
@@ -642,7 +647,9 @@ class CUDATracingPipeline : public Pipeline {
                        float *quantile_dpeths,
                        uint32_t *quantile_point_indices,
                        uint32_t *num_intersections,
-                       void *point_contribution) override {
+                       uint32_t contribution_size,
+                       void *point_contribution,
+                       const void *weight_contribution) override {
 
         CUDAArray<Vec4h> adjacent_diff(point_adjacency_size + 32);
         prefetch_adjacent_diff(reinterpret_cast<const Vec3f *>(points),
@@ -673,7 +680,9 @@ class CUDATracingPipeline : public Pipeline {
             quantile_dpeths,
             quantile_point_indices,
             num_intersections,
-            static_cast<attr_scalar *>(point_contribution));
+            contribution_size,
+            static_cast<attr_scalar *>(point_contribution),
+            static_cast<const attr_scalar *>(weight_contribution));
     }
 
     void trace_backward(const TraceSettings &settings,

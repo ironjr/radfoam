@@ -163,14 +163,11 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 depth_quantiles = torch.rand(*ray_batch.shape[:-1], 2, device=device).sort(dim=-1, descending=True).values
 
                 # Calculate negative log probability (energy)
-                rgba_output, depth, contributions, _, _ = model(
+                rgba_output, depth, _, _, _ = model(
                     ray_batch,
                     depth_quantiles=depth_quantiles,
-                    return_contribution=True,
                     return_statistics=True,
                 )
-
-                import pdb; pdb.set_trace()
 
                 # White background
                 opacity = rgba_output[..., -1:]
@@ -199,8 +196,9 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
 
                 model.optimizer.zero_grad(set_to_none=True)
                 energy.backward()
+
                 stats = model.get_grad_stats()
-                import pdb; pdb.set_trace()
+
                 model.optimizer.step()
 
                 # Calculate batch-wise energy at proposed state
@@ -220,11 +218,21 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     
                     energy_prop_per_sample = (color_loss_prop + opacity_loss_prop + w_depth * quant_loss_prop)  # Shape: (N,)
 
+                # Calculate per-sample energy contribution
+                with torch.no_grad():
+                    energy_total = torch.stack([energy_per_sample, energy_prop_per_sample], dim=-1)
+                    _, _, contributions, _, _ = model(
+                        ray_batch,
+                        depth_quantiles=depth_quantiles,
+                        weight_contribution=energy_total,
+                    )
+                    contributions_base, contributions_prop = contributions.split(1, dim=-1)
+
                 # Calculate acceptance probability per sample
                 accept_prob = torch.min(
-                    torch.ones_like(energy_per_sample),
-                    torch.exp((energy_per_sample - energy_prop_per_sample) / temperature)
-                )  # Shape: (N,)
+                    torch.ones_like(contributions_base),
+                    torch.exp((contributions_base - contributions_prop) / temperature)
+                )[:, 0]  # Shape: (N,)
 
                 # TODO: This is ray-wise, not per-sample
                 # Should collect per-sample acceptance probabilities from ray-wise data
@@ -239,23 +247,26 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 accepted_mask = (random_numbers < accept_prob)  # Shape: (N,)
 
                 # Reject: Revert parameters selectively based on accepted_mask
-                with torch.no_grad():
-                    for name, param in model.named_parameters():
-                        # Selectively update parameters
-                        if param.shape[0] == accepted_mask.shape[0]:  # Only for parameters with batch dimension
-                            mask_expanded = accepted_mask.view(-1, *([1] * (param.dim() - 1)))
-                            param.data = torch.where(mask_expanded, param.data, current_params[name])
-                            
-                            # Selectively update optimizer states
-                            if param in current_states:
-                                for key, value in current_states[param].items():
-                                    if torch.is_tensor(value) and value.shape[0] == accepted_mask.shape[0]:
-                                        mask_expanded = accepted_mask.view(-1, *([1] * (value.dim() - 1)))
-                                        model.optimizer.state[param][key] = torch.where(
-                                            mask_expanded,
-                                            model.optimizer.state[param][key],
-                                            value
-                                        )
+                if (~accepted_mask).any():
+                    with torch.no_grad():
+                        for name, param in model.named_parameters():
+                            # Selectively update parameters
+                            if param.shape[0] == accepted_mask.shape[0]:  # Only for parameters with batch dimension
+                                mask_expanded = accepted_mask.view(-1, *([1] * (param.dim() - 1)))
+                                param.data = torch.where(mask_expanded, param.data, current_params[name])
+                                
+                                # Selectively update optimizer states
+                                if param in current_states:
+                                    for key, value in current_states[param].items():
+                                        if key == 'step':
+                                            continue
+                                        if torch.is_tensor(value) and value.shape[0] == accepted_mask.shape[0]:
+                                            mask_expanded = accepted_mask.view(-1, *([1] * (value.dim() - 1)))
+                                            model.optimizer.state[param][key] = torch.where(
+                                                mask_expanded,
+                                                model.optimizer.state[param][key],
+                                                value
+                                            )
 
                 event.synchronize()
                 ray_batch, rgb_batch = next(data_iterator)
@@ -266,10 +277,10 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 # Update progress bar
                 train.set_postfix({
                     'energy': energy.item(),
-                    'energy_prop': energy_prop_per_sample.mean().item(),
-                    'accept_prob': accept_prob.mean().item(),
-                    'mean_energy': energy_per_sample.mean().item(),
-                    'accept_rate': accepted_mask.float().mean().item()
+                    'mean_energy': contributions_base.mean().item(),
+                    'mean_energy_prop': contributions_prop.mean().item(),
+                    'reject_prob': (1.0 - accept_prob).mean().item(),
+                    'reject_rate': (1.0 - accepted_mask.float().mean().item())
                 })
 
                 if i % 100 == 99 and not pipeline_args.debug:

@@ -114,7 +114,7 @@ py::object trace_forward(Pipeline &self,
                          std::optional<torch::Tensor> depth_quantiles_in,
                          py::object weight_threshold,
                          py::object max_intersections,
-                         bool return_contribution) {
+                         std::optional<torch::Tensor> weight_contribution_in) {
     torch::Tensor points = points_in.contiguous();
     torch::Tensor attributes = attributes_in.contiguous();
     torch::Tensor point_adjacency = point_adjacency_in.contiguous();
@@ -130,6 +130,7 @@ py::object trace_forward(Pipeline &self,
                         point_adjacency_offsets_in);
 
     bool return_depth = depth_quantiles_in.has_value();
+    bool return_contribution = weight_contribution_in.has_value();
 
     uint32_t num_points = points.size(0);
     uint32_t point_adjacency_size = point_adjacency.size(0);
@@ -200,10 +201,28 @@ py::object trace_forward(Pipeline &self,
                      torch::dtype(scalar_to_type_meta(ScalarType::UInt32))
                          .device(rays.device()));
 
+    uint32_t contribution_size = 1;
     torch::Tensor output_contribution;
+    torch::Tensor weight_contribution;
     if (return_contribution) {
+        weight_contribution = weight_contribution_in.value().contiguous();
+        if (weight_contribution.numel() != 0 && weight_contribution.size(0) != num_rays) {
+            throw std::runtime_error("weight_contribution_in must have the same "
+                                     "batch size as rays");
+        }
+        if (weight_contribution.dim() != 2) {
+            throw std::runtime_error("weight_contribution_in must have 2 dimensions");
+        }
+
+        if (weight_contribution.numel() == 0) {
+            weight_contribution = torch::ones(
+                {num_rays, 1},
+                torch::dtype(scalar_to_type_meta(self.attribute_type()))
+                    .device(rays.device()));
+        }
+        contribution_size = weight_contribution.size(1);
         output_contribution = torch::zeros(
-            {num_points, 1},
+            {num_points, contribution_size},
             torch::dtype(scalar_to_type_meta(self.attribute_type()))
                 .device(rays.device()));
     }
@@ -247,7 +266,13 @@ py::object trace_forward(Pipeline &self,
             ? reinterpret_cast<uint32_t *>(output_depth_indices.data_ptr())
             : nullptr,
         reinterpret_cast<uint32_t *>(num_intersections.data_ptr()),
-        return_contribution ? output_contribution.data_ptr() : nullptr);
+        contribution_size,
+        return_contribution
+            ? output_contribution.data_ptr()
+            : nullptr,
+        return_contribution
+            ? weight_contribution.data_ptr()
+            : nullptr);
 
     py::dict output_dict;
 
@@ -659,7 +684,7 @@ void init_pipeline_bindings(py::module &module) {
              py::arg("depth_quantiles") = py::none(),
              py::arg("weight_threshold") = py::none(),
              py::arg("max_intersections") = py::none(),
-             py::arg("return_contribution") = false)
+             py::arg("weight_contribution") = py::none())
         .def("trace_backward",
              trace_backward,
              py::arg("points"),
